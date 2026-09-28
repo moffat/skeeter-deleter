@@ -8,6 +8,7 @@ import rich.progress
 from atproto import CAR, Client, models
 from atproto_core.cid import CID
 from atproto_client.request import Request
+from atproto_client.exceptions import AtProtocolError
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -79,23 +80,22 @@ class PostQualifier(models.AppBskyFeedDefs.PostView):
     
     def _init_PostQualifier(self, client : Client):
         self.client = client
+        self._like_uri = None    # AT URI of the user's like record (from listRecords)
+        self._repost_uri = None  # AT URI of the user's repost record (from listRecords)
 
     def delete_like(self):
         """
         Remove a like from a post
         """
+        like_uri = self._like_uri or (self.viewer.like if self.viewer else None)
+        if like_uri is None:
+            logging.warning(f"Skipping unlike for {self.uri}: no like record URI found")
+            return
         try:
-            logging.info(f"Removing like: {self.viewer.like}")
-            self.client.delete_like(self.viewer.like)
-        except httpx.HTTPStatusError as e:
-            logging.error(f"HTTP error occurred while unliking: {e}")
-            try:
-                logging.info(f"Removing like via URI: {self.uri}")
-                self.client.delete_like(self.uri)
-            except httpx.HTTPStatusError as e:
-                logging.error(f"HTTP error occurred while unliking via URI: {e}")
-            except Exception as e:
-                raise e
+            logging.info(f"Removing like: {like_uri}")
+            self.client.delete_like(like_uri)
+        except AtProtocolError as e:
+            logging.error(f"Error while unliking {like_uri}: {e}")
         except Exception as e:
             logging.error(f"An error occurred while unliking: {e}")
 
@@ -104,19 +104,23 @@ class PostQualifier(models.AppBskyFeedDefs.PostView):
         Remove a repost or delete an authored post
         """
         if self.author.did != self.client.me.did:
+            repost_uri = self._repost_uri or (self.viewer.repost if self.viewer else None)
+            if repost_uri is None:
+                logging.warning(f"Skipping unrepost for {self.uri}: no repost record URI found")
+                return
             try:
-                logging.info(f"Removing repost: {self.viewer.repost}")
-                self.client.unrepost(self.viewer.repost)
-            except httpx.HTTPStatusError as e:
-                logging.error(f"HTTP error occurred during unreposting: {e}")
+                logging.info(f"Removing repost: {repost_uri}")
+                self.client.unrepost(repost_uri)
+            except AtProtocolError as e:
+                logging.error(f"Error during unreposting {repost_uri}: {e}")
             except Exception as e:
                 logging.error(f"An error occurred during unreposting: {e}")
         else:
             try:
                 logging.info(f"Removing post: {self.uri}")
                 self.client.delete_post(self.uri)
-            except httpx.HTTPStatusError as e:
-                logging.error(f"HTTP error occurred during deletion: {e}")
+            except AtProtocolError as e:
+                logging.error(f"Error during deletion of {self.uri}: {e}")
             except Exception as e:
                 logging.error(f"An error occurred during deletion: {e}")
 
@@ -215,33 +219,54 @@ class SkeeterDeleter:
             return block
 
     def gather_likes(self,
-                     repo,
                      stale_threshold,
                      now,
                      **kwargs) -> list[PostQualifier]:
-        archive = CAR.from_bytes(repo)
-        likes = list(map(partial(self.extract_feed_item, archive),
-                         filter(lambda x: 'app.bsky.feed.like' in str(x),
-                                [archive.blocks.get(cid) for cid in archive.blocks])))
-        
-        self_likes = list(filter(lambda x: archive.blocks.get(x['subject']['cid']),
-                                 filter(lambda x : self.client.me.did in x['subject']['uri'], likes)))
-        other_likes = list(filter(lambda x : self.client.me.did not in x['subject']['uri'], likes))
-        
-        # The API limits the get_posts method to 25 results at a time. 
-        to_unlike = []
-        for batch in self.chunker(other_likes, 25):
+        # Use listRecords as the single authoritative source for like records.
+        # This correctly identifies self-liked posts (to protect from deletion)
+        # and gives us the AT URI of each like record (needed to delete it).
+        like_uri_map = {}  # subject_uri -> like_record_uri
+        cursor = None
+        while True:
             try:
-                posts_to_unlike = self.client.get_posts(uris=[x['subject']['uri']
-                                                            for x in batch])
-                to_unlike.extend(
-                    list(filter(
-                        partial(PostQualifier.to_remove, stale_threshold, now),
-                        map(partial(PostQualifier.cast, self.client),
-                            posts_to_unlike.posts)
-                    ))
-                )
-            except httpx.HTTPStatusError as e:
+                resp = self.client.com.atproto.repo.list_records(params={
+                    'repo': self.client.me.did,
+                    'collection': 'app.bsky.feed.like',
+                    'cursor': cursor,
+                    'limit': 100,
+                })
+                for r in resp.records:
+                    subject_uri = (r.value.subject.uri
+                                   if hasattr(r.value, 'subject')
+                                   else r.value.get('subject', {}).get('uri'))
+                    if subject_uri:
+                        like_uri_map[subject_uri] = r.uri
+                cursor = resp.cursor
+                if not cursor:
+                    break
+            except Exception as e:
+                logging.error(f"An error occurred while fetching like record URIs: {e}")
+                break
+
+        # Self-likes: likes of the user's own posts, identified by DID in the subject URI.
+        # These protect matching authored posts from deletion.
+        self_likes = [{'subject': {'uri': uri}} for uri in like_uri_map
+                      if self.client.me.did in uri]
+
+        # Other likes: likes of posts by other accounts, candidates for unliking.
+        other_like_uris = [uri for uri in like_uri_map if self.client.me.did not in uri]
+
+        # The API limits the get_posts method to 25 results at a time.
+        to_unlike = []
+        for batch in self.chunker(other_like_uris, 25):
+            try:
+                posts_to_unlike = self.client.get_posts(uris=batch)
+                for post in posts_to_unlike.posts:
+                    pq = PostQualifier.cast(self.client, post)
+                    pq._like_uri = like_uri_map.get(pq.uri)
+                    if PostQualifier.to_remove(stale_threshold, now, pq):
+                        to_unlike.append(pq)
+            except AtProtocolError as e:
                 logging.error(f"An HTTP error occured while fetching likes: {e}")
             except Exception as e:
                 logging.error(f"An error occured while fetching likes: {e}")
@@ -249,39 +274,50 @@ class SkeeterDeleter:
         return self_likes, to_unlike
 
     def gather_reposts(self,
-                       repo,
                        viral_threshold,
                        stale_threshold,
                        domains_to_protect,
                        now,
                        self_likes,
                        **kwargs) -> list[PostQualifier]:
-        archive = CAR.from_bytes(repo)
-        
-        reposts = list(
-            filter(lambda x : '$type' in x and
-                   "app.bsky.feed.repost" in str(x),
-                   [archive.blocks.get(cid) for cid in archive.blocks]
-            )
-        )
-        to_unrepost = []
-        for batch in self.chunker(reposts, 25):
+        # Use listRecords to get repost records with their AT URIs directly.
+        # This avoids relying on viewer.repost from get_posts(), which can be None
+        # when the AppView is out of sync with the repo or when posts are deleted.
+        all_reposts = []  # list of {'subject_uri': str, 'repost_uri': str}
+        cursor = None
+        while True:
             try:
-                posts_to_remove = self.client.get_posts(uris=[x['subject']['uri']
-                                                            for x in batch])
-                to_unrepost.extend(
-                    list(filter(
-                        partial(PostQualifier.to_delete,
-                                viral_threshold,
-                                stale_threshold,
-                                domains_to_protect,
-                                now,
-                                self_likes),
-                        map(partial(PostQualifier.cast, self.client),
-                            posts_to_remove.posts)
-                    ))
-                )
-            except httpx.HTTPStatusError as e:
+                resp = self.client.com.atproto.repo.list_records(params={
+                    'repo': self.client.me.did,
+                    'collection': 'app.bsky.feed.repost',
+                    'cursor': cursor,
+                    'limit': 100,
+                })
+                for r in resp.records:
+                    subject_uri = (r.value.subject.uri
+                                   if hasattr(r.value, 'subject')
+                                   else r.value.get('subject', {}).get('uri'))
+                    if subject_uri:
+                        all_reposts.append({'subject_uri': subject_uri, 'repost_uri': r.uri})
+                cursor = resp.cursor
+                if not cursor:
+                    break
+            except Exception as e:
+                logging.error(f"An error occurred while fetching repost records: {e}")
+                break
+
+        to_unrepost = []
+        for batch in self.chunker(all_reposts, 25):
+            try:
+                uri_to_repost_uri = {x['subject_uri']: x['repost_uri'] for x in batch}
+                posts_to_remove = self.client.get_posts(uris=list(uri_to_repost_uri.keys()))
+                for post in posts_to_remove.posts:
+                    pq = PostQualifier.cast(self.client, post)
+                    pq._repost_uri = uri_to_repost_uri.get(pq.uri)
+                    if PostQualifier.to_delete(viral_threshold, stale_threshold,
+                                              domains_to_protect, now, self_likes, pq):
+                        to_unrepost.append(pq)
+            except AtProtocolError as e:
                 logging.error(f"An HTTP error occured while fetching reposts: {e}")
             except Exception as e:
                 logging.error(f"An error occured while fetching reposts: {e}")
@@ -318,13 +354,39 @@ class SkeeterDeleter:
                 cursor = posts.cursor
                 if self.verbosity > 0:
                     print(f"Cursor at: {cursor}")
-            except httpx.HTTPStatusError as e:
+            except AtProtocolError as e:
+                # Stop paging: the cursor didn't advance, so retrying would loop forever
                 logging.error(f"An HTTP error occured while fetching posts: {e}")
+                break
             except Exception as e:
                 logging.error(f"An error occured while fetching posts: {e}")
+                break
             if cursor == None:
                 break
         return to_delete
+
+    def dry_run_summary(self) -> None:
+        """Print a summary of what would be deleted/unliked/unreposted without taking any action."""
+        n_unlike = len(self.to_unlike)
+        n_delete = sum(1 for p in self.to_delete if p.author.did == self.client.me.did)
+        n_unrepost = sum(1 for p in self.to_delete if p.author.did != self.client.me.did)
+
+        print(f"\n=== Dry-run summary (no changes made) ===")
+        print(f"  Likes to remove : {n_unlike}")
+        for post in self.to_unlike:
+            print(f"    [like]    {post.record.created_at}  @{post.author.handle}  {post.uri}")
+        print(f"  Reposts to undo : {n_unrepost}")
+        for post in self.to_delete:
+            if post.author.did != self.client.me.did:
+                print(f"    [repost]  {post.record.created_at}  @{post.author.handle}  {post.uri}")
+        print(f"  Posts to delete : {n_delete}")
+        for post in self.to_delete:
+            if post.author.did == self.client.me.did:
+                text_preview = (post.record.text[:80].replace('\n', ' ')
+                                if hasattr(post.record, 'text') and post.record.text else '')
+                print(f"    [post]    {post.record.created_at}  {text_preview!r}")
+        print()
+        logging.info(f"Dry-run: would unlike {n_unlike}, unrepost {n_unrepost}, delete {n_delete}")
 
     def batch_unlike_posts(self) -> None:
         logging.info(f"Unliking {len(self.to_unlike)} post{'' if len(self.to_unlike) == 1 else 's'}")
@@ -382,7 +444,9 @@ class SkeeterDeleter:
                  domains_to_protect : list[str]=[],
                  fixed_likes_cursor : str=None,
                  verbosity : int=0,
-                 autodelete : bool=False):
+                 autodelete : bool=False,
+                 dry_run : bool=False,
+                 min_posts_to_keep : int=10):
         self.client = Client(request=RequestCustomTimeout())
         self.client.login(**credentials.dict())
 
@@ -396,13 +460,19 @@ class SkeeterDeleter:
         }
         self.verbosity = verbosity
         self.autodelete = autodelete
+        self.dry_run = dry_run
 
-        repo = self.archive_repo(**params)
+        self.archive_repo(**params)
 
-        self_likes, self.to_unlike = self.gather_likes(repo, **params)
+        profile = self.client.get_profile(self.client.me.handle)
+        current_count = profile.posts_count or 0
+        print(f"Account @{self.client.me.handle} has {current_count} post{'' if current_count == 1 else 's'} total.")
+
+        self_likes, self.to_unlike = self.gather_likes(**params)
         print(f"Found {len(self.to_unlike)} post{'' if len(self.to_unlike) == 1 else 's'} to unlike.")
-        
-        to_unrepost = self.gather_reposts(repo, self_likes=self_likes, **params)
+        print(f"  (Protecting {len(self_likes)} self-liked post{'' if len(self_likes) == 1 else 's'} from deletion.)")
+
+        to_unrepost = self.gather_reposts(self_likes=self_likes, **params)
         print(f"Found {len(to_unrepost)} post{'' if len(to_unrepost) == 1 else 's'} to unrepost.")
 
         self.to_delete = self.gather_posts_to_delete(self_likes=self_likes, **params)
@@ -410,9 +480,32 @@ class SkeeterDeleter:
 
         self.to_delete.extend(to_unrepost)
 
+        # Enforce minimum post count: trim the most-recent authored posts from
+        # to_delete so the account never drops below min_posts_to_keep.
+        if min_posts_to_keep > 0:
+            authored = [p for p in self.to_delete if p.author.did == self.client.me.did]
+            would_remain = current_count - len(authored)
+            if would_remain < min_posts_to_keep:
+                to_protect = min_posts_to_keep - would_remain
+                # Sort authored posts newest-first and protect the most recent ones.
+                authored_sorted = sorted(
+                    authored,
+                    key=lambda p: p.record.created_at,
+                    reverse=True
+                )
+                protected = set(id(p) for p in authored_sorted[:to_protect])
+                removed = len(protected)
+                self.to_delete = [p for p in self.to_delete if id(p) not in protected]
+                print(f"  (Keeping {removed} recent post{'' if removed == 1 else 's'} to stay above the {min_posts_to_keep}-post minimum.)")
+
 
     def unlike(self):
+        if self.dry_run:
+            return
         n_unlike = len(self.to_unlike)
+        if n_unlike == 0:
+            print("Nothing to unlike.")
+            return
         prompt = None
         while not self.autodelete and prompt not in ("Y", "n"):
             prompt = input(f"""
@@ -421,7 +514,12 @@ Proceed to unlike {n_unlike} post{'' if n_unlike == 1 else 's'}? WARNING: THIS I
             sd.batch_unlike_posts()
 
     def delete(self):
+        if self.dry_run:
+            return
         n_delete = len(self.to_delete)
+        if n_delete == 0:
+            print("Nothing to delete.")
+            return
         prompt = None
         while not self.autodelete and prompt not in ("Y", "n"):
             prompt = input(f"""
@@ -452,6 +550,12 @@ default="")
                            action="store_true")
     parser.add_argument("-y", "--yes", help="""Ignore warning prompts for deletion. Necessary for running in automation.""",
                         action="store_true", default=False)
+    parser.add_argument("-n", "--dry-run", help="""Show a summary of posts, likes, and boosts that would be deleted without
+making any changes. Useful for verifying settings before running for real.""",
+                        action="store_true", default=False)
+    parser.add_argument("-m", "--min-posts", help="""The minimum number of your own posts to keep on the account. Deletion will
+preserve the most recent posts needed to stay at or above this count. Set to 0 to disable.
+Defaults to 10.""", default=10, type=int)
     args = parser.parse_args()
 
     creds = Credentials(os.environ["BLUESKY_USERNAME"],
@@ -469,9 +573,14 @@ default="")
                                      for s in args.domains_to_protect.split(",")]),
         'fixed_likes_cursor': args.fixed_likes_cursor,
         'verbosity': verbosity,
-        'autodelete': args.yes
+        'autodelete': args.yes,
+        'dry_run': args.dry_run,
+        'min_posts_to_keep': max(0, args.min_posts),
     }
 
     sd = SkeeterDeleter(credentials=creds, **params)
-    sd.unlike()
-    sd.delete()
+    if sd.dry_run:
+        sd.dry_run_summary()
+    else:
+        sd.unlike()
+        sd.delete()
